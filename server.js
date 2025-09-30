@@ -51,6 +51,8 @@ app.post('/auth/google', async (req, res) => {
     // Issue your own app session
     const appJwt = jwt.sign({ uid: userId, email }, JWT_SECRET, { expiresIn: '7d' });
 
+    console.log(tokenStore);
+
     res.json({ token: appJwt });
   } catch (err) {
     console.error(err);
@@ -88,7 +90,6 @@ async function getGoogleClientFor(userId) {
   return client;
 }
 
-// Example API, list the user’s Drive files using stored tokens
 app.get('/google/drive/files', async (req, res) => {
   try {
     // replace with your auth, for demo assume uid query param
@@ -107,7 +108,6 @@ app.get('/google/drive/files', async (req, res) => {
   }
 });
 
-// Example API, list next 10 calendar events
 app.get('/google/calendar/events', async (req, res) => {
   try {
     const userId = req.query.uid;
