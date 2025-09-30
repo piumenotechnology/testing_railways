@@ -54,6 +54,10 @@ app.post('/auth/google', async (req, res) => {
     const code = req.body?.code;
     if (!code) return res.status(400).json({ error: 'Missing code' });
 
+    console.log('WEB_ID:', WEB_ID);
+    console.log('Using redirect:', 'postmessage'); // you hardcode it in OAuth2Client
+    console.log('incoming code len:', (req.body?.code || '').length);
+
     const oauth = mobileClient();
     const { tokens } = await oauth.getToken({ code }); // id_token, access_token, refresh_token?, expiry_date, scope
 
