@@ -3,6 +3,7 @@ const express = require('express');
 const { OAuth2Client } = require('google-auth-library');
 const { google } = require('googleapis');
 const jwt = require('jsonwebtoken');
+require('dotenv').config();
 
 const app = express();
 app.use(express.json());
@@ -13,11 +14,24 @@ const JWT_SECRET = process.env.JWT_SECRET;
 
 // redirect must be "postmessage" for mobile code exchange
 const oauth2 = new OAuth2Client(GOOGLE_WEB_CLIENT_ID, GOOGLE_WEB_CLIENT_SECRET, 'postmessage');
+// const oauth2 = new OAuth2Client(GOOGLE_WEB_CLIENT_ID, GOOGLE_WEB_CLIENT_SECRET, 'https://developers.google.com/oauthplayground');
 
 // fake DB, replace with your DB
 const tokenStore = new Map(); // key: userId, value: { access_token, refresh_token, expiry_date, scope, id, email }
 
 app.get('/', (req, res) => res.send('Hello World'));
+
+app.post('/auth/google/playground', async (req, res) => {
+  const { code } = req.body || {};
+  if (!code) return res.status(400).send('Missing code');
+
+  const client = new OAuth2Client(GOOGLE_WEB_CLIENT_ID, GOOGLE_WEB_CLIENT_SECRET, 'https://developers.google.com/oauthplayground');
+  const { tokens } = await client.getToken({ code }); // works with Playground codes
+  const ticket = await client.verifyIdToken({ idToken: tokens.id_token, audience: WEB_ID });
+  const payload = ticket.getPayload();
+  res.json({ email: payload.email, scope: tokens.scope, hasRefresh: !!tokens.refresh_token });
+});
+
 
 app.post('/auth/google', async (req, res) => {
   try {
