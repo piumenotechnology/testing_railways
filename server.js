@@ -1,148 +1,200 @@
-// npm i express google-auth-library googleapis jsonwebtoken
+require('dotenv').config();
 const express = require('express');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
 const { OAuth2Client } = require('google-auth-library');
 const { google } = require('googleapis');
-const jwt = require('jsonwebtoken');
-require('dotenv').config();
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
-const GOOGLE_WEB_CLIENT_ID = process.env.GOOGLE_WEB_CLIENT_ID;       // same as Flutter serverClientId
-const GOOGLE_WEB_CLIENT_SECRET = process.env.GOOGLE_WEB_CLIENT_SECRET;
+const PORT = process.env.PORT || 3000;
+const WEB_ID = process.env.GOOGLE_WEB_CLIENT_ID;
+const WEB_SECRET = process.env.GOOGLE_WEB_CLIENT_SECRET;
 const JWT_SECRET = process.env.JWT_SECRET;
 
-// redirect must be "postmessage" for mobile code exchange
-const oauth2 = new OAuth2Client(GOOGLE_WEB_CLIENT_ID, GOOGLE_WEB_CLIENT_SECRET, 'postmessage');
-// const oauth2 = new OAuth2Client(GOOGLE_WEB_CLIENT_ID, GOOGLE_WEB_CLIENT_SECRET, 'https://developers.google.com/oauthplayground');
+if (!WEB_ID || !WEB_SECRET || !JWT_SECRET) {
+  throw new Error('Missing env, set GOOGLE_WEB_CLIENT_ID, GOOGLE_WEB_CLIENT_SECRET, JWT_SECRET');
+}
+if (!WEB_ID.endsWith('.apps.googleusercontent.com')) {
+  throw new Error('GOOGLE_WEB_CLIENT_ID is not a Web client ID');
+}
 
-// fake DB, replace with your DB
-const tokenStore = new Map(); // key: userId, value: { access_token, refresh_token, expiry_date, scope, id, email }
+const tokenStore = Object.create(null);
 
-app.get('/', (req, res) => res.send('Hello World'));
+function mobileClient() {
+  return new OAuth2Client(WEB_ID, WEB_SECRET, 'postmessage');
+}
 
-app.post('/auth/google/playground', async (req, res) => {
-  const { code } = req.body || {};
-  if (!code) return res.status(400).send('Missing code');
+/*
+  App JWT helpers
+*/
+function signAppJwt({ uid, email }) {
+  return jwt.sign({ uid, email }, JWT_SECRET, { expiresIn: '7d' });
+}
+function authMiddleware(req, res, next) {
+  const h = req.headers.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Missing Authorization header' });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid session' });
+  }
+}
 
-  const client = new OAuth2Client(GOOGLE_WEB_CLIENT_ID, GOOGLE_WEB_CLIENT_SECRET, 'https://developers.google.com/oauthplayground');
-  const { tokens } = await client.getToken({ code }); // works with Playground codes
-  const ticket = await client.verifyIdToken({ idToken: tokens.id_token, audience: WEB_ID });
-  const payload = ticket.getPayload();
-  res.json({ email: payload.email, scope: tokens.scope, hasRefresh: !!tokens.refresh_token });
-});
-
-
+/*
+  Exchange auth code from Flutter, verify ID token, store Google tokens,
+  return your own app session
+*/
 app.post('/auth/google', async (req, res) => {
   try {
-    const { code } = req.body;
-    if (!code) return res.status(400).send('Missing code');
+    const code = req.body?.code;
+    if (!code) return res.status(400).json({ error: 'Missing code' });
 
-    // Exchange serverAuthCode for tokens
-    const { tokens } = await oauth2.getToken({ code }); // redirect_uri is already set to 'postmessage'
-    // tokens will include id_token, access_token, refresh_token (maybe), scope, expiry_date
+    const oauth = mobileClient();
+    const { tokens } = await oauth.getToken({ code }); // id_token, access_token, refresh_token?, expiry_date, scope
 
-    // Verify the ID token to get user identity, also confirms audience
-    const ticket = await oauth2.verifyIdToken({
-      idToken: tokens.id_token,
-      audience: GOOGLE_WEB_CLIENT_ID,
-    });
-    const payload = ticket.getPayload();
-    const userId = payload.sub;
-    const email = payload.email;
+    // Verify identity
+    const ticket = await oauth.verifyIdToken({ idToken: tokens.id_token, audience: WEB_ID });
+    const payload = ticket.getPayload(); // sub, email, name, picture
+    const uid = payload.sub;
 
-    // Persist tokens server side
-    const existing = tokenStore.get(userId) || {};
-    tokenStore.set(userId, {
-      ...existing,
+    // Persist tokens
+    const prev = tokenStore[uid] || {};
+    tokenStore[uid] = {
       access_token: tokens.access_token,
-      refresh_token: tokens.refresh_token || existing.refresh_token, // keep old one if new is missing
-      expiry_date: tokens.expiry_date, // ms since epoch
+      refresh_token: tokens.refresh_token || prev.refresh_token, // keep old if new is missing
+      expiry_date: tokens.expiry_date,
       scope: tokens.scope,
-      email,
+      email: payload.email,
+      name: payload.name,
+      picture: payload.picture,
+    };
+
+    // Issue your app session
+    const appJwt = signAppJwt({ uid, email: payload.email });
+
+    res.json({
+      token: appJwt,
+      profile: { uid, email: payload.email, name: payload.name, picture: payload.picture },
+      granted_scopes: tokens.scope?.split(' ') || [],
+      has_refresh_token: Boolean(tokens.refresh_token || prev.refresh_token),
     });
-
-    // Issue your own app session
-    const appJwt = jwt.sign({ uid: userId, email }, JWT_SECRET, { expiresIn: '7d' });
-
-    console.log(tokenStore);
-
-    res.json({ token: appJwt });
-  } catch (err) {
-    console.error(err);
-    res.status(401).send('Google auth failed');
+  } catch (e) {
+    const err = e.response?.data || { message: e.message };
+    console.error('OAuth exchange failed:', err);
+    res.status(400).json({ error: 'OAuth exchange failed', detail: err });
   }
 });
 
-// helper, returns an authenticated google client for a user, auto refreshes if needed
-async function getGoogleClientFor(userId) {
-  const rec = tokenStore.get(userId);
-  if (!rec) throw new Error('No Google tokens stored for user');
+/*
+  Helper, get an authenticated Google client for a user, auto refresh access token
+*/
+async function getGoogleClientFor(uid) {
+  const rec = tokenStore[uid];
+  if (!rec) throw new Error('No Google tokens for user');
 
-  const client = new OAuth2Client(GOOGLE_WEB_CLIENT_ID, GOOGLE_WEB_CLIENT_SECRET, 'postmessage');
+  const client = mobileClient();
   client.setCredentials({
     access_token: rec.access_token,
-    refresh_token: rec.refresh_token, // may be undefined if user never granted offline access
+    refresh_token: rec.refresh_token,
     expiry_date: rec.expiry_date,
   });
 
-  // Check expiry, refresh if needed
   const now = Date.now();
-  if (!rec.expiry_date || rec.expiry_date <= now) {
-    // getAccessToken triggers refresh if refresh_token is set
-    const at = await client.getAccessToken();
-    if (!at || !at.token) throw new Error('Failed to refresh Google access token');
-    // google-auth-library updates client.credentials, copy back to store
+  // Refresh if missing or expired
+  if (!rec.expiry_date || rec.expiry_date <= now - 5000) {
+    const at = await client.getAccessToken(); // triggers refresh when refresh_token is set
+    if (!at || !at.token) {
+      throw new Error('Failed to refresh access token, user may need to re link');
+    }
     const creds = client.credentials;
-    tokenStore.set(userId, {
+    tokenStore[uid] = {
       ...rec,
       access_token: creds.access_token,
       expiry_date: creds.expiry_date,
-      // refresh_token may only appear on the first exchange, keep existing one
-    });
+    };
   }
+
   return client;
 }
 
-app.get('/google/drive/files', async (req, res) => {
-  try {
-    // replace with your auth, for demo assume uid query param
-    const userId = req.query.uid;
-    const client = await getGoogleClientFor(userId);
+/*
+  Example protected endpoint that uses only your app session
+*/
+app.get('/me', authMiddleware, (req, res) => {
+  const rec = tokenStore[req.user.uid];
+  res.json({
+    uid: req.user.uid,
+    email: rec?.email,
+    name: rec?.name,
+    picture: rec?.picture,
+    granted_scopes: rec?.scope?.split(' ') || [],
+  });
+});
 
+/*
+  Example Google API call, Drive file list
+  Requires that user granted drive.readonly or stronger
+*/
+app.get('/google/drive/files', authMiddleware, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const client = await getGoogleClientFor(uid);
     const drive = google.drive({ version: 'v3', auth: client });
-    const resp = await drive.files.list({
+    const r = await drive.files.list({
       pageSize: 10,
-      fields: 'files(id, name, mimeType, modifiedTime)',
+      fields: 'files(id,name,mimeType,modifiedTime)',
     });
-    res.json(resp.data);
+    res.json(r.data);
   } catch (e) {
-    console.error(e);
-    res.status(401).send('Drive access failed');
+    const err = e.response?.data || { message: e.message };
+    res.status(400).json({ error: 'Drive call failed', detail: err });
   }
 });
 
-app.get('/google/calendar/events', async (req, res) => {
+/*
+  Example Google API call, Calendar next events
+  Requires calendar.readonly or stronger
+*/
+app.get('/google/calendar/events', authMiddleware, async (req, res) => {
   try {
-    const userId = req.query.uid;
-    const client = await getGoogleClientFor(userId);
-
+    const uid = req.user.uid;
+    const client = await getGoogleClientFor(uid);
     const calendar = google.calendar({ version: 'v3', auth: client });
-    const resp = await calendar.events.list({
+    const r = await calendar.events.list({
       calendarId: 'primary',
       maxResults: 10,
       singleEvents: true,
       orderBy: 'startTime',
       timeMin: new Date().toISOString(),
     });
-    res.json(resp.data);
+    res.json(r.data);
   } catch (e) {
-    console.error(e);
-    res.status(401).send('Calendar access failed');
+    const err = e.response?.data || { message: e.message };
+    res.status(400).json({ error: 'Calendar call failed', detail: err });
   }
 });
 
-const PORT = process.env.PORT || 3000;
+/*
+  Unlink, forget tokens server side
+*/
+app.post('/auth/google/unlink', authMiddleware, async (req, res) => {
+  const uid = req.user.uid;
+  delete tokenStore[uid];
+  res.json({ ok: true });
+});
+
+/*
+  Health and debug
+*/
+app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/debug/store', (req, res) => res.json(tokenStore)); // remove in production
+
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`Server on http://localhost:${PORT}`);
+  console.log('WEB_ID:', WEB_ID);
 });
