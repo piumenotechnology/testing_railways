@@ -17,6 +17,8 @@ const oauth2 = new OAuth2Client(GOOGLE_WEB_CLIENT_ID, GOOGLE_WEB_CLIENT_SECRET, 
 // fake DB, replace with your DB
 const tokenStore = new Map(); // key: userId, value: { access_token, refresh_token, expiry_date, scope, id, email }
 
+app.get('/', (req, res) => res.send('Hello World'));
+
 app.post('/auth/google', async (req, res) => {
   try {
     const { code } = req.body;
